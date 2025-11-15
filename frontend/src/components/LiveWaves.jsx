@@ -1,0 +1,128 @@
+import { useMemo } from 'react';
+import { DEFAULT_BANDS, useMuseStream } from '../hooks/useMuseStream.js';
+
+const BAND_COLORS = {
+  delta: '#38bdf8',
+  theta: '#a855f7',
+  alpha: '#22d3ee',
+  beta: '#f472b6',
+};
+
+function formatNumber(value) {
+  if (value === undefined || value === null || Number.isNaN(value)) {
+    return '--';
+  }
+  return Number(value).toFixed(2);
+}
+
+export default function LiveWaves({ url }) {
+  const { bandSeries, latest, status, error } = useMuseStream(url);
+  const width = 800;
+  const height = 300;
+
+  const paths = useMemo(() => {
+    const resolved = {};
+    DEFAULT_BANDS.forEach((band) => {
+      const series = bandSeries[band] || [];
+      if (!series.length) {
+        return;
+      }
+      const values = series.map((point) => point.value ?? 0);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = max - min || 1;
+      const step = series.length > 1 ? width / (series.length - 1) : width;
+      const path = series
+        .map((point, index) => {
+          const normalized = (point.value - min) / span;
+          const x = index * step;
+          const y = height - normalized * height;
+          return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
+        })
+        .join(' ');
+      resolved[band] = { path, min, max };
+    });
+    return resolved;
+  }, [bandSeries, width, height]);
+
+  const statusLabel = {
+    connecting: 'Connecting to backend...',
+    online: 'Streaming from backend',
+    disconnected: 'Disconnected',
+    error: 'Connection error',
+  }[status] || 'Idle';
+
+  return (
+    <div>
+      <div className="status">
+        <span className={`status-dot ${status === 'online' ? 'online' : ''}`} />
+        <span>{statusLabel}</span>
+        {latest?.mode === 'mock' && (
+          <span className="badge" title="Streaming simulated data">
+            Mock data
+          </span>
+        )}
+      </div>
+      {error && (
+        <p style={{ color: '#dc2626', marginTop: '0.5rem' }}>{error}</p>
+      )}
+
+      <div className="chart-wrapper">
+        <svg viewBox={`0 0 ${width} ${height}`} className="chart-svg" role="img">
+          <defs>
+            <linearGradient id="gridGradient" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="rgba(148, 163, 184, 0.25)" />
+              <stop offset="100%" stopColor="rgba(15, 23, 42, 0.1)" />
+            </linearGradient>
+          </defs>
+          {[...Array(6)].map((_, index) => (
+            <line
+              key={index}
+              x1={0}
+              y1={(height / 5) * index}
+              x2={width}
+              y2={(height / 5) * index}
+              stroke="rgba(148, 163, 184, 0.1)"
+              strokeWidth="1"
+            />
+          ))}
+          {Object.entries(paths).map(([band, info]) => (
+            <path
+              key={band}
+              d={info.path}
+              fill="none"
+              stroke={BAND_COLORS[band]}
+              strokeWidth="2"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              opacity="0.9"
+            />
+          ))}
+        </svg>
+      </div>
+
+      <div className="legend">
+        {DEFAULT_BANDS.map((band) => (
+          <div key={band} className="legend-item">
+            <span
+              className="legend-swatch"
+              style={{ backgroundColor: BAND_COLORS[band] }}
+            />
+            <span style={{ textTransform: 'capitalize' }}>{band}</span>
+          </div>
+        ))}
+      </div>
+
+      {latest && latest.metrics && (
+        <div className="metrics-grid">
+          {Object.entries(latest.metrics).map(([key, value]) => (
+            <div key={key} className="metric">
+              <div className="metric-label">{key.replace('_', ' ')}</div>
+              <div className="metric-value">{formatNumber(value)}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
