@@ -3,18 +3,60 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
-from typing import Any, Dict, List, Optional
+import warnings
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import neurokit2 as nk
+from neurokit2.misc import NeuroKitWarning
+from pydantic import BaseModel, Field
 from pylsl import StreamInlet, resolve_byprop
 
 import utils
 
 BAND_NAMES = ["delta", "theta", "alpha", "beta"]
+METRIC_NAMES = ["alpha_relaxation", "beta_concentration", "theta_relaxation"]
+HRV_METRIC_NAMES = ["hrv_rmssd", "hrv_sdnn", "hrv_lf_hf"]
+DEFAULT_BASELINE_SECONDS = 60
+NEGATIVE_ALERT_METRICS = {"alpha_relaxation", "theta_relaxation", "beta_concentration", "hrv_rmssd", "hrv_sdnn"}
+POSITIVE_ALERT_METRICS = {"hrv_lf_hf"}
+
+
+class MetricStats(BaseModel):
+    mean: float
+    std: float
+
+
+class BaselineRequest(BaseModel):
+    duration_seconds: float = Field(DEFAULT_BASELINE_SECONDS, ge=30, le=600)
+    hrv_window_seconds: float = Field(30.0, ge=10.0, le=120.0)
+    hrv_step_seconds: float = Field(10.0, ge=5.0, le=60.0)
+
+
+class BaselineResponse(BaseModel):
+    duration_seconds: float
+    sample_count: int
+    hrv_window_seconds: float
+    hrv_window_count: int
+    metrics: Dict[str, MetricStats]
+
+
+class MonitorRequest(BaseModel):
+    baseline: BaselineResponse
+    duration_seconds: float = Field(30.0, ge=10.0, le=180.0)
+    deviation_threshold: float = Field(2.0, ge=0.5, le=6.0)
+
+
+class MonitorResponse(BaseModel):
+    timestamp: float
+    metrics: Dict[str, float]
+    deviations: Dict[str, float]
+    alerts: List[str]
+    sample_count: int
+    hrv_sample_seconds: float
 
 
 class MuseMetricsSession:
@@ -28,7 +70,6 @@ class MuseMetricsSession:
         index_channels: Optional[List[int]] = None,
         pull_timeout: float = 1.0,
         max_pull_retries: int = 5,
-        enable_mock: Optional[bool] = None,
     ) -> None:
         self.buffer_length = buffer_length
         self.epoch_length = epoch_length
@@ -44,27 +85,12 @@ class MuseMetricsSession:
         self.band_buffer: Optional[np.ndarray] = None
         self.filter_state: Any = None
 
-        env_mock = os.environ.get('MUSE_MOCK_MODE') or os.environ.get('MUSE_ENABLE_MOCK')
-        if enable_mock is not None:
-            self.allow_mock = enable_mock
-        elif env_mock is not None:
-            self.allow_mock = (env_mock or '').lower() in {'1', 'true', 'yes'}
-        else:
-            self.allow_mock = True
-
-        self.mock_active = False
-        self._mock_phase = 0.0
-        self.mode = 'init'
-
     def _connect(self) -> None:
-        if self.inlet is not None or self.mock_active:
+        if self.inlet is not None:
             return
 
         streams = resolve_byprop('type', 'EEG', timeout=2)
         if not streams:
-            if self.allow_mock:
-                self._activate_mock()
-                return
             raise RuntimeError("Can't find EEG stream. Ensure the Muse is streaming over LSL.")
 
         self.inlet = StreamInlet(streams[0], max_chunklen=12)
@@ -72,25 +98,12 @@ class MuseMetricsSession:
 
         info = self.inlet.info()
         self.fs = int(info.nominal_srate() or 256)
-        self._initialize_buffers()
-        self.mode = 'live'
-
-    def _initialize_buffers(self) -> None:
-        assert self.fs is not None
         n_channels = len(self.index_channels)
         self.eeg_buffer = np.zeros((int(self.fs * self.buffer_length), n_channels))
         self.filter_state = None
-        n_win_test = int(
-            np.floor((self.buffer_length - self.epoch_length) / self.shift_length + 1)
-        )
-        self.band_buffer = np.zeros((n_win_test, 4))
 
-    def _activate_mock(self) -> None:
-        self.mock_active = True
-        self.fs = 256
-        self._mock_phase = 0.0
-        self._initialize_buffers()
-        self.mode = 'mock'
+        n_win_test = int(np.floor((self.buffer_length - self.epoch_length) / self.shift_length + 1))
+        self.band_buffer = np.zeros((n_win_test, 4))
 
     def close(self) -> None:
         if self.inlet is not None:
@@ -98,16 +111,10 @@ class MuseMetricsSession:
                 self.inlet.close_stream()
             finally:
                 self.inlet = None
-        self.mock_active = False
-        self.mode = 'init'
 
     def _pull_chunk(self) -> np.ndarray:
-        assert self.fs is not None
-
-        if self.mock_active:
-            return self._generate_mock_chunk()
-
         assert self.inlet is not None
+        assert self.fs is not None
 
         for _ in range(self.max_pull_retries):
             chunk, _ = self.inlet.pull_chunk(
@@ -117,31 +124,6 @@ class MuseMetricsSession:
             if chunk:
                 return np.asarray(chunk)
         raise RuntimeError('Timed out while waiting for EEG data from the Muse headset.')
-
-    def _generate_mock_chunk(self) -> np.ndarray:
-        assert self.fs is not None
-        samples = max(1, int(self.shift_length * self.fs))
-        start = self._mock_phase
-        t = start + (np.arange(samples) / self.fs)
-        self._mock_phase += samples / self.fs
-
-        max_index = max(self.index_channels) if self.index_channels else 0
-        n_channels = max_index + 1
-        chunk = np.zeros((samples, n_channels))
-
-        base_delta = np.sin(2 * np.pi * 2 * t)
-        base_theta = np.sin(2 * np.pi * 6 * t + 0.5)
-        base_alpha = np.sin(2 * np.pi * 10 * t + 1.1)
-        base_beta = np.sin(2 * np.pi * 18 * t + 0.25)
-        composite = 35 * base_delta + 25 * base_theta + 15 * base_alpha + 10 * base_beta
-
-        for idx in range(n_channels):
-            phase = idx * 0.15
-            chunk[:, idx] = composite + 5 * np.sin(2 * np.pi * 0.5 * (t + phase))
-
-        noise = np.random.normal(0, 2, size=chunk.shape)
-        chunk += noise
-        return chunk
 
     def get_metrics(self) -> Dict[str, Any]:
         self._connect()
@@ -202,18 +184,279 @@ class MuseMetricsSession:
             'bands': band_dict,
             'smoothed_bands': smooth_band_dict,
             'metrics': metrics,
-            'mode': self.mode,
         }
+
+
+class PPGStreamSession:
+    """Simple helper to pull PPG samples for HRV analysis."""
+
+    def __init__(self, channel_index: int = 0, pull_timeout: float = 0.5) -> None:
+        self.channel_index = channel_index
+        self.pull_timeout = pull_timeout
+        self.inlet: Optional[StreamInlet] = None
+        self.fs: Optional[int] = None
+
+    def _connect(self) -> None:
+        if self.inlet is not None:
+            return
+
+        streams = resolve_byprop('type', 'PPG', timeout=5)
+        if not streams:
+            raise RuntimeError("Can't find PPG stream. Ensure the Muse PPG is streaming over LSL.")
+
+        self.inlet = StreamInlet(streams[0], max_chunklen=64)
+        self.inlet.time_correction()
+
+        info = self.inlet.info()
+        self.fs = int(info.nominal_srate() or 64)
+
+    def close(self) -> None:
+        if self.inlet is not None:
+            try:
+                self.inlet.close_stream()
+            finally:
+                self.inlet = None
+
+    def collect_samples(self, duration_seconds: float) -> Tuple[np.ndarray, int]:
+        self._connect()
+        assert self.inlet is not None
+        assert self.fs is not None
+
+        samples: List[float] = []
+        start_time = time.time()
+        try:
+            while time.time() - start_time < duration_seconds:
+                chunk, _ = self.inlet.pull_chunk(timeout=self.pull_timeout)
+                if not chunk:
+                    continue
+                arr = np.asarray(chunk)
+                if arr.size == 0:
+                    continue
+                if arr.ndim == 1:
+                    values = arr
+                else:
+                    idx = min(self.channel_index, arr.shape[1] - 1)
+                    values = arr[:, idx]
+                samples.extend(values.tolist())
+        finally:
+            self.close()
+
+        return np.asarray(samples, dtype=float), self.fs
+
+
+def _collect_eeg_payloads(duration_seconds: float) -> List[Dict[str, Any]]:
+    session = MuseMetricsSession()
+    payloads: List[Dict[str, Any]] = []
+    start_time = time.time()
+    try:
+        while time.time() - start_time < duration_seconds:
+            payloads.append(session.get_metrics())
+    finally:
+        session.close()
+    return payloads
+
+
+def _collect_ppg_samples(duration_seconds: float) -> Tuple[np.ndarray, int]:
+    session = PPGStreamSession()
+    return session.collect_samples(duration_seconds)
+
+
+def _metric_stats(values: Sequence[float]) -> MetricStats:
+    clean_values = [float(v) for v in values if v is not None and not np.isnan(v)]
+    if not clean_values:
+        return MetricStats(mean=0.0, std=0.0)
+    arr = np.asarray(clean_values, dtype=float)
+    std = float(np.std(arr, ddof=1)) if arr.size > 1 else 0.0
+    return MetricStats(mean=float(np.mean(arr)), std=std)
+
+
+def summarize_metric_series(metric_series: Sequence[Dict[str, float]]) -> Dict[str, MetricStats]:
+    summary: Dict[str, MetricStats] = {}
+    for metric in METRIC_NAMES:
+        values = [row.get(metric) for row in metric_series if row.get(metric) is not None]
+        summary[metric] = _metric_stats(values)
+    return summary
+
+
+def average_metric_series(metric_series: Sequence[Dict[str, float]]) -> Dict[str, float]:
+    averages: Dict[str, float] = {}
+    for metric in METRIC_NAMES:
+        values = [row.get(metric) for row in metric_series if row.get(metric) is not None]
+        averages[metric] = float(np.mean(values)) if values else 0.0
+    return averages
+
+
+def _extract_hrv_value(hrv_frame: Any, column: str) -> float:
+    if hrv_frame is None or column not in hrv_frame:
+        return 0.0
+    series = hrv_frame[column]
+    if getattr(series, 'size', 0) == 0:
+        return 0.0
+    value = float(series.iloc[0]) if hasattr(series, 'iloc') else float(series[0])
+    if np.isnan(value):
+        return 0.0
+    return value
+
+
+def compute_hrv_metrics(samples: np.ndarray, fs: int) -> Dict[str, float]:
+    if samples.size == 0 or fs is None or fs <= 0:
+        raise RuntimeError('Not enough PPG samples to compute HRV metrics.')
+
+    signals, info = nk.ppg_process(samples, sampling_rate=fs)
+    peaks = info.get('PPG_Peaks')
+    if peaks is None or len(peaks) < 3:
+        raise RuntimeError('Unable to detect enough PPG peaks for HRV analysis.')
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=NeuroKitWarning)
+        hrv_time = nk.hrv(peaks, sampling_rate=fs, show=False, method='time')
+        try:
+            hrv_frequency = nk.hrv(peaks, sampling_rate=fs, show=False, method='frequency')
+        except Exception:
+            hrv_frequency = None
+    return {
+        'hrv_rmssd': _extract_hrv_value(hrv_time, 'HRV_RMSSD'),
+        'hrv_sdnn': _extract_hrv_value(hrv_time, 'HRV_SDNN'),
+        'hrv_lf_hf': _extract_hrv_value(hrv_frequency, 'HRV_LFHF'),
+    }
+
+
+def compute_hrv_windows(
+    samples: np.ndarray,
+    fs: int,
+    window_seconds: float,
+    step_seconds: float,
+) -> List[Dict[str, float]]:
+    if samples.size == 0:
+        raise RuntimeError('No PPG samples were collected for HRV computation.')
+    if fs is None or fs <= 0:
+        raise RuntimeError('Invalid PPG sampling rate.')
+
+    window_samples = int(window_seconds * fs)
+    step_samples = max(int(step_seconds * fs), 1)
+    if window_samples <= 0 or samples.size < window_samples:
+        raise RuntimeError('Not enough PPG data to compute an HRV baseline.')
+
+    metrics_windows: List[Dict[str, float]] = []
+    for start in range(0, samples.size - window_samples + 1, step_samples):
+        segment = samples[start:start + window_samples]
+        try:
+            metrics_windows.append(compute_hrv_metrics(segment, fs))
+        except RuntimeError:
+            continue
+
+    if not metrics_windows:
+        raise RuntimeError('Unable to compute HRV metrics from the collected samples.')
+
+    return metrics_windows
+
+
+def summarize_hrv_windows(hrv_windows: Sequence[Dict[str, float]]) -> Dict[str, MetricStats]:
+    summary: Dict[str, MetricStats] = {}
+    for metric in HRV_METRIC_NAMES:
+        values = [window.get(metric) for window in hrv_windows if window.get(metric) is not None]
+        summary[metric] = _metric_stats(values)
+    return summary
+
+
+async def collect_sensor_data(duration_seconds: float) -> Tuple[List[Dict[str, Any]], np.ndarray, int]:
+    loop = asyncio.get_running_loop()
+    eeg_task = loop.run_in_executor(None, lambda: _collect_eeg_payloads(duration_seconds))
+    ppg_task = loop.run_in_executor(None, lambda: _collect_ppg_samples(duration_seconds))
+    payloads, (ppg_samples, ppg_fs) = await asyncio.gather(eeg_task, ppg_task)
+    return payloads, ppg_samples, ppg_fs
+
+
+class BaselineCalculator:
+    def __init__(
+        self,
+        duration_seconds: float,
+        hrv_window_seconds: float,
+        hrv_step_seconds: float,
+    ) -> None:
+        self.duration_seconds = duration_seconds
+        self.hrv_window_seconds = hrv_window_seconds
+        self.hrv_step_seconds = hrv_step_seconds
+
+    async def calculate(self) -> BaselineResponse:
+        payloads, ppg_samples, ppg_fs = await collect_sensor_data(self.duration_seconds)
+        metric_series = [payload.get('metrics') for payload in payloads if payload.get('metrics')]
+        if not metric_series:
+            raise RuntimeError('Unable to compute EEG metrics for baseline calculation.')
+
+        hrv_windows = compute_hrv_windows(
+            ppg_samples, ppg_fs, self.hrv_window_seconds, self.hrv_step_seconds
+        )
+
+        summary = summarize_metric_series(metric_series)
+        summary.update(summarize_hrv_windows(hrv_windows))
+
+        return BaselineResponse(
+            duration_seconds=self.duration_seconds,
+            sample_count=len(metric_series),
+            hrv_window_seconds=self.hrv_window_seconds,
+            hrv_window_count=len(hrv_windows),
+            metrics=summary,
+        )
+
+
+async def sample_current_metrics(duration_seconds: float) -> Tuple[Dict[str, float], int, float]:
+    payloads, ppg_samples, ppg_fs = await collect_sensor_data(duration_seconds)
+    metric_series = [payload.get('metrics') for payload in payloads if payload.get('metrics')]
+    if not metric_series:
+        raise RuntimeError('Unable to compute EEG metrics for monitoring.')
+
+    averages = average_metric_series(metric_series)
+    hrv_metrics = compute_hrv_metrics(ppg_samples, ppg_fs)
+    averages.update(hrv_metrics)
+
+    hrv_seconds = float(ppg_samples.size / ppg_fs) if ppg_fs else 0.0
+    return averages, len(metric_series), hrv_seconds
+
+
+def compute_deviations(
+    current_metrics: Dict[str, float],
+    baseline: BaselineResponse,
+    threshold: float,
+) -> Tuple[Dict[str, float], List[str]]:
+    deviations: Dict[str, float] = {}
+    alerts: List[str] = []
+    for metric, stats in baseline.metrics.items():
+        value = current_metrics.get(metric)
+        if value is None:
+            continue
+        std = stats.std
+        if std is not None and std > 1e-6:
+            z_score = (value - stats.mean) / std
+        else:
+            z_score = 0.0
+        deviations[metric] = float(z_score)
+        if std is None or std <= 1e-6:
+            continue
+        direction = 'positive'
+        if metric in NEGATIVE_ALERT_METRICS:
+            direction = 'negative'
+        elif metric in POSITIVE_ALERT_METRICS:
+            direction = 'positive'
+        if direction == 'negative' and z_score <= -threshold:
+            alerts.append(
+                f"{metric} dropped -{abs(z_score):.1f}σ (current={value:.2f}, baseline={stats.mean:.2f})"
+            )
+        elif direction == 'positive' and z_score >= threshold:
+            alerts.append(
+                f"{metric} spiked +{z_score:.1f}σ (current={value:.2f}, baseline={stats.mean:.2f})"
+            )
+    return deviations, alerts
 
 
 app = FastAPI(title='Muse Metrics API', version='0.1.0')
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=['*'],
+    allow_credentials=False,
+    allow_methods=['*'],
+    allow_headers=['*'],
 )
 
 
@@ -231,6 +474,44 @@ async def read_metrics() -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     finally:
         session.close()
+
+
+@app.post('/baseline', response_model=BaselineResponse)
+async def calculate_baseline_endpoint(request: BaselineRequest) -> BaselineResponse:
+    calculator = BaselineCalculator(
+        duration_seconds=request.duration_seconds,
+        hrv_window_seconds=request.hrv_window_seconds,
+        hrv_step_seconds=request.hrv_step_seconds,
+    )
+    try:
+        return await calculator.calculate()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post('/monitor', response_model=MonitorResponse)
+async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
+    try:
+        current_metrics, sample_count, hrv_seconds = await sample_current_metrics(
+            request.duration_seconds
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    deviations, alerts = compute_deviations(
+        current_metrics=current_metrics,
+        baseline=request.baseline,
+        threshold=request.deviation_threshold,
+    )
+
+    return MonitorResponse(
+        timestamp=time.time(),
+        metrics=current_metrics,
+        deviations=deviations,
+        alerts=alerts,
+        sample_count=sample_count,
+        hrv_sample_seconds=hrv_seconds,
+    )
 
 
 @app.websocket('/ws/metrics')

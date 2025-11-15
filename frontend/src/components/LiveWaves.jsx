@@ -16,14 +16,20 @@ function formatNumber(value) {
   return Number(value).toFixed(2);
 }
 
-export default function LiveWaves({ url }) {
+export default function LiveWaves({
+  url,
+  width = 800,
+  height = 300,
+  showStatus = true,
+  showNotifications = true,
+  showLegend = true,
+  showMetricGrid = true,
+  className = '',
+}) {
   const { bandSeries, latest, status, error } = useMuseStream(url);
 
   // Enable browser notifications for low concentration
   const { permissionStatus, lastAlertTime } = useConcentrationNotifications(latest, 0);
-
-  const width = 800;
-  const height = 300;
 
   const paths = useMemo(() => {
     const resolved = {};
@@ -58,66 +64,70 @@ export default function LiveWaves({ url }) {
   }[status] || 'Idle';
 
   return (
-    <div>
-      <div className="status">
-        <span className={`status-dot ${status === 'online' ? 'online' : ''}`} />
-        <span>{statusLabel}</span>
-        {latest?.mode === 'mock' && (
-          <span className="badge" title="Streaming simulated data">
-            Mock data
-          </span>
-        )}
-      </div>
+    <div className={`live-waves ${className}`.trim()}>
+      {showStatus && (
+        <div className="status">
+          <span className={`status-dot ${status === 'online' ? 'online' : ''}`} />
+          <span>{statusLabel}</span>
+          {latest?.mode === 'mock' && (
+            <span className="badge" title="Streaming simulated data">
+              Mock data
+            </span>
+          )}
+        </div>
+      )}
 
-      <div className="status" style={{ marginTop: '0.5rem' }}>
-        <span>🔔 Notifications: </span>
-        <span style={{
-          color: permissionStatus === 'granted' ? '#22c55e' :
-                 permissionStatus === 'denied' ? '#dc2626' : '#fbbf24',
-          fontWeight: 'bold'
-        }}>
-          {permissionStatus === 'granted' ? 'Enabled' :
-           permissionStatus === 'denied' ? 'Blocked' :
-           permissionStatus === 'requesting' ? 'Requesting...' : 'Checking...'}
-        </span>
-        {permissionStatus === 'granted' && (
-          <button
-            onClick={() => {
-              new Notification('Test Notification 🧪', {
-                body: 'If you see this, notifications are working!',
-                tag: 'test-notification',
-              });
-            }}
-            style={{
-              marginLeft: '0.5rem',
-              padding: '0.25rem 0.5rem',
-              fontSize: '0.85em',
-              cursor: 'pointer',
-              borderRadius: '4px',
-              border: '1px solid #ccc',
-              background: '#f0f0f0',
-            }}
-          >
-            Test Notification
-          </button>
-        )}
-        {lastAlertTime && (
-          <span className="badge" style={{ marginLeft: '0.5rem' }}>
-            Last alert: {lastAlertTime}
+      {showNotifications && (
+        <div className="status" style={{ marginTop: showStatus ? '0.5rem' : 0 }}>
+          <span>🔔 Notifications: </span>
+          <span style={{
+            color: permissionStatus === 'granted' ? '#22c55e' :
+                   permissionStatus === 'denied' ? '#dc2626' : '#fbbf24',
+            fontWeight: 'bold'
+          }}>
+            {permissionStatus === 'granted' ? 'Enabled' :
+             permissionStatus === 'denied' ? 'Blocked' :
+             permissionStatus === 'requesting' ? 'Requesting...' : 'Checking...'}
           </span>
-        )}
-        {latest?.metrics?.beta_concentration !== undefined && (
-          <span style={{ marginLeft: '0.5rem', fontSize: '0.9em', opacity: 0.8 }}>
-            (Beta: {formatNumber(latest.metrics.beta_concentration)})
-          </span>
-        )}
-      </div>
+          {permissionStatus === 'granted' && (
+            <button
+              onClick={() => {
+                new Notification('Test Notification 🧪', {
+                  body: 'If you see this, notifications are working!',
+                  tag: 'test-notification',
+                });
+              }}
+              style={{
+                marginLeft: '0.5rem',
+                padding: '0.25rem 0.5rem',
+                fontSize: '0.85em',
+                cursor: 'pointer',
+                borderRadius: '4px',
+                border: '1px solid #ccc',
+                background: '#f0f0f0',
+              }}
+            >
+              Test Notification
+            </button>
+          )}
+          {lastAlertTime && (
+            <span className="badge" style={{ marginLeft: '0.5rem' }}>
+              Last alert: {lastAlertTime}
+            </span>
+          )}
+          {latest?.metrics?.beta_concentration !== undefined && (
+            <span style={{ marginLeft: '0.5rem', fontSize: '0.9em', opacity: 0.8 }}>
+              (Beta: {formatNumber(latest.metrics.beta_concentration)})
+            </span>
+          )}
+        </div>
+      )}
 
       {error && (
         <p style={{ color: '#dc2626', marginTop: '0.5rem' }}>{error}</p>
       )}
 
-      <div className="chart-wrapper">
+      <div className={`chart-wrapper ${!showLegend && !showMetricGrid ? 'chart-wrapper-compact' : ''}`}>
         <svg viewBox={`0 0 ${width} ${height}`} className="chart-svg" role="img">
           <defs>
             <linearGradient id="gridGradient" x1="0" y1="0" x2="0" y2="1">
@@ -151,19 +161,21 @@ export default function LiveWaves({ url }) {
         </svg>
       </div>
 
-      <div className="legend">
-        {DEFAULT_BANDS.map((band) => (
-          <div key={band} className="legend-item">
-            <span
-              className="legend-swatch"
-              style={{ backgroundColor: BAND_COLORS[band] }}
-            />
-            <span style={{ textTransform: 'capitalize' }}>{band}</span>
-          </div>
-        ))}
-      </div>
+      {showLegend && (
+        <div className="legend">
+          {DEFAULT_BANDS.map((band) => (
+            <div key={band} className="legend-item">
+              <span
+                className="legend-swatch"
+                style={{ backgroundColor: BAND_COLORS[band] }}
+              />
+              <span style={{ textTransform: 'capitalize' }}>{band}</span>
+            </div>
+          ))}
+        </div>
+      )}
 
-      {latest && latest.metrics && (
+      {showMetricGrid && latest && latest.metrics && (
         <div className="metrics-grid">
           {Object.entries(latest.metrics).map(([key, value]) => (
             <div key={key} className="metric">
