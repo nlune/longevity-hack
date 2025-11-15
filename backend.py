@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pylsl import StreamInlet, resolve_byprop
 
 import utils
@@ -206,6 +207,14 @@ class MuseMetricsSession:
 
 
 app = FastAPI(title='Muse Metrics API', version='0.1.0')
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get('/health')
