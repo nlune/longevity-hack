@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import math
+import os
 import time
 import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import neurokit2 as nk
 from neurokit2.misc import NeuroKitWarning
 from pydantic import BaseModel, Field
 from pylsl import StreamInlet, resolve_byprop
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request as GoogleRequest
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from groq import Groq
+from dotenv import load_dotenv
 import json
 import subprocess
 
@@ -34,6 +43,12 @@ COMPOSITE_WEIGHTS = {
     'hrv_sdnn': 1.0,
     'hrv_lf_hf': 0.8,
 }
+CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+TOKEN_STORE_PATH = os.environ.get('GOOGLE_TOKEN_STORE', 'calendar_tokens.json')
+PENDING_STATES: Dict[str, str] = {}
+
+
+load_dotenv()
 
 
 class MetricStats(BaseModel):
@@ -75,6 +90,24 @@ class NotificationRequest(BaseModel):
     message: str
     title: str = 'Stress Compass'
     delay_seconds: float = Field(0.0, ge=0.0, le=3600.0)
+
+
+class CalendarEvent(BaseModel):
+    summary: str
+    start: str
+    end: str
+    start_ts: float
+    end_ts: float
+    location: Optional[str] = None
+    status: Optional[str] = None
+
+
+class CalendarResponse(BaseModel):
+    events: List[CalendarEvent]
+
+
+class AgentTriggerRequest(BaseModel):
+    composite_score: float
 
 
 class MuseMetricsSession:
@@ -485,6 +518,141 @@ async def _dispatch_notification(message: str, title: str, delay_seconds: float)
         print(f'Failed to deliver notification: {exc}')
 
 
+def _client_config() -> Dict[str, Any]:
+    client_id = os.environ.get('GOOGLE_OAUTH_CLIENT_ID')
+    client_secret = os.environ.get('GOOGLE_OAUTH_CLIENT_SECRET')
+    if not client_id or not client_secret:
+        raise RuntimeError('GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET must be set.')
+    return {
+        'web': {
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+            'token_uri': 'https://oauth2.googleapis.com/token',
+        }
+    }
+
+
+def _token_store() -> Dict[str, Any]:
+    if not os.path.exists(TOKEN_STORE_PATH):
+        return {}
+    with open(TOKEN_STORE_PATH, 'r', encoding='utf-8') as handle:
+        try:
+            return json.load(handle)
+        except json.JSONDecodeError:
+            return {}
+
+
+def _save_token_store(store: Dict[str, Any]) -> None:
+    with open(TOKEN_STORE_PATH, 'w', encoding='utf-8') as handle:
+        json.dump(store, handle)
+
+
+def _store_credentials(client_id: str, creds: Credentials) -> None:
+    store = _token_store()
+    store[client_id] = {
+        'token': creds.token,
+        'refresh_token': creds.refresh_token,
+        'token_uri': creds.token_uri,
+        'client_id': creds.client_id,
+        'client_secret': creds.client_secret,
+        'scopes': creds.scopes,
+    }
+    _save_token_store(store)
+
+
+def _load_credentials(client_id: str) -> Credentials:
+    store = _token_store()
+    data = store.get(client_id)
+    if not data:
+        raise RuntimeError('Calendar not connected for this client.')
+    creds = Credentials(**data)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(GoogleRequest())
+        _store_credentials(client_id, creds)
+    return creds
+
+
+def _create_flow(state: str) -> Flow:
+    flow = Flow.from_client_config(_client_config(), CALENDAR_SCOPES, state=state)
+    flow.redirect_uri = os.environ.get('GOOGLE_OAUTH_REDIRECT_URI', 'http://localhost:8000/calendar/oauth/callback')
+    return flow
+
+
+def fetch_calendar_events(creds: Credentials) -> List[CalendarEvent]:
+    service = build('calendar', 'v3', credentials=creds, cache_discovery=False)
+    now = dt.datetime.now(dt.timezone.utc)
+    start_of_day = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = start_of_day + dt.timedelta(days=1)
+    calendar_id = os.environ.get('GOOGLE_CALENDAR_ID', 'primary')
+    events_result = service.events().list(
+        calendarId=calendar_id,
+        timeMin=start_of_day.isoformat(),
+        timeMax=end_of_day.isoformat(),
+        singleEvents=True,
+        orderBy='startTime',
+    ).execute()
+    events: List[CalendarEvent] = []
+    for event in events_result.get('items', []):
+        start_raw = event.get('start', {}).get('dateTime') or event.get('start', {}).get('date')
+        end_raw = event.get('end', {}).get('dateTime') or event.get('end', {}).get('date')
+        if not start_raw or not end_raw:
+            continue
+        try:
+            start_dt = dt.datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
+            end_dt = dt.datetime.fromisoformat(end_raw.replace('Z', '+00:00'))
+        except ValueError:
+            continue
+        events.append(
+            CalendarEvent(
+                summary=event.get('summary', 'Untitled event'),
+                start=start_dt.isoformat(),
+                end=end_dt.isoformat(),
+                start_ts=start_dt.timestamp(),
+                end_ts=end_dt.timestamp(),
+                location=event.get('location'),
+                status=event.get('transparency') or event.get('status'),
+            )
+        )
+    return events
+
+
+def _generate_intervention_message(
+    composite_score: float,
+    current_event: Optional[CalendarEvent],
+    next_event: Optional[CalendarEvent],
+) -> str:
+    api_key = os.environ.get('GROQ_API_KEY')
+    if not api_key:
+        return (
+            'Take a mindful pause. You have a heightened stress index right now.'
+            + (f" You're in '{current_event.summary}'." if current_event else '')
+        )
+    client = Groq(api_key=api_key)
+    context = [
+        f'Stress index: {composite_score:.2f}',
+        f'Current event: {current_event.summary if current_event else "None"}',
+        f'Next event: {next_event.summary if next_event else "None"}',
+    ]
+    prompt = (
+        'You are Stress Compass, a workplace wellbeing guide. '
+        'Given the following context, write a short actionable intervention (max 2 sentences) '
+        'that helps the user self-regulate. Mention if they are currently in a meeting and suggest '
+        'a gentle strategy. Context:\n' + '\n'.join(context)
+    )
+    try:
+        response = client.chat.completions.create(
+            model='mixtral-8x7b-32768',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.3,
+            max_tokens=120,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as exc:  # pragma: no cover
+        print(f'Groq request failed: {exc}')
+        return 'Take a mindful pause and reset your nervous system.'
+
+
 app = FastAPI(title='Muse Metrics API', version='0.1.0')
 
 app.add_middleware(
@@ -562,6 +730,84 @@ async def schedule_notification(request: NotificationRequest, background_tasks: 
         request.delay_seconds,
     )
     return {'status': 'scheduled', 'delay_seconds': request.delay_seconds}
+
+
+@app.get('/calendar/events', response_model=CalendarResponse)
+async def read_calendar_events(client_id: str) -> CalendarResponse:
+    try:
+        creds = _load_credentials(client_id)
+        events = fetch_calendar_events(creds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return CalendarResponse(events=events)
+
+
+@app.post('/agent/mock-trigger')
+async def mock_trigger(request: AgentTriggerRequest, client_id: str):
+    try:
+        creds = _load_credentials(client_id)
+        events = fetch_calendar_events(creds)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    now_ts = time.time()
+    current_event = next((event for event in events if event.start_ts <= now_ts <= event.end_ts), None)
+    next_event = next((event for event in events if event.start_ts > now_ts), None)
+
+    message = _generate_intervention_message(request.composite_score, current_event, next_event)
+    delay = 0.0
+    if current_event and current_event.status != 'transparent':
+        delay = max(0.0, current_event.end_ts - now_ts)
+    asyncio.create_task(_dispatch_notification(message, 'Stress Compass', delay))
+    return {
+        'status': 'scheduled' if delay > 0 else 'sent',
+        'delay_seconds': delay,
+        'message': message,
+        'current_event': current_event,
+        'next_event': next_event,
+    }
+
+
+@app.get('/calendar/status', response_model=None)
+async def calendar_status(client_id: str):
+    connected = client_id in _token_store()
+    return {'connected': connected}
+
+
+@app.get('/calendar/connect/start', response_model=None)
+async def calendar_connect_start(client_id: str):
+    state = f'{client_id}:{int(time.time())}'
+    flow = _create_flow(state)
+    auth_url, _ = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent',
+    )
+    PENDING_STATES[state] = client_id
+    return {'auth_url': auth_url}
+
+
+@app.get('/calendar/oauth/callback', response_model=None)
+async def calendar_oauth_callback(request: Request):
+    state = request.query_params.get('state')
+    code = request.query_params.get('code')
+    error = request.query_params.get('error')
+    if error:
+        return HTMLResponse(f"<p>Authorization failed: {error}</p>")
+    client_id = PENDING_STATES.pop(state, None)
+    if not client_id or not code:
+        return HTMLResponse('<p>Invalid or expired authorization state.</p>')
+    flow = _create_flow(state)
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:
+        return HTMLResponse(f'<p>Failed to exchange token: {exc}</p>')
+    _store_credentials(client_id, flow.credentials)
+    return HTMLResponse('<p>Stress Compass connected! You can close this window.</p>')
 
 
 @app.websocket('/ws/metrics')

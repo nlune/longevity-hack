@@ -13,7 +13,8 @@ The goal is simple: deliver a subtle nudge the moment your mind drifts into dysr
 3. `POST /baseline` records a one-minute calibration window (EEG bands + HRV).
 4. `POST /monitor` samples a fresh window, compares against baseline, and returns deviations plus alerts when stress proxies spike.
 5. `POST /notify` (macOS) schedules a desktop notification with a configurable delay—used now for manual tests and later by the agentic workflow.
-6. `GET /metrics` and `ws://localhost:8000/ws/metrics` expose the raw streaming data for the frontend.
+6. `GET /calendar/events` & `POST /agent/mock-trigger` integrate with Google Calendar and the Groq-based agent: the agent inspects the current/next meetings, decides when to nudge, and sends the intervention via `/notify`.
+7. `GET /metrics` and `ws://localhost:8000/ws/metrics` expose the raw streaming data for the frontend.
 
 _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=true` to enable the built-in simulator for UI testing.
 
@@ -34,5 +35,18 @@ _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=t
   - *Stress / scatter* weighs LF/HF against HRV RMSSD to detect sympathetic spikes.
   A weighted composite of all deviations (positive spikes inverted, negative drops preserved) becomes the **stress index**, the single number used for current alerts and future agentic logic.
 - **Nudges, not nags:** Positive deviations (e.g., calmer-than-usual alpha or steadier HRV) appear in green cards and history charts. Negative deviations (stress spikes, engagement drops, HRV dips) tint red/orange and may trigger notifications so you can intervene early.
+
+### Calendar & Agent Integration
+
+1. Create a Google Cloud project, enable the Calendar API, and configure an OAuth **Web application** client (authorized redirect URI: `http://localhost:8000/calendar/oauth/callback`).
+2. Set environment variables:
+   - `GOOGLE_OAUTH_CLIENT_ID=...`
+   - `GOOGLE_OAUTH_CLIENT_SECRET=...`
+   - Optional: `GOOGLE_OAUTH_REDIRECT_URI` (defaults to `http://localhost:8000/calendar/oauth/callback`).
+   - Optional: `GOOGLE_CALENDAR_ID` (defaults to `primary`).
+   - Optional: `GOOGLE_TOKEN_STORE` to change where OAuth tokens are cached locally.
+3. Provide a `GROQ_API_KEY` so the agent can craft contextual interventions.
+4. In the UI, click **Connect calendar**. A Google consent window opens; select your calendar account. Once connected, you’ll see today’s events listed and the agent can reason about current/next meetings.
+5. Use **Mock stress trigger** to simulate a high stress index. The backend agent checks current/next events, decides whether to delay the notification (e.g., during a meeting), and schedules the desktop intervention via `/notify`.
 
 By cycling between awareness and action throughout the day, Stress Compass helps dial down chronic sympathetic load—the exact pattern linked to burnout, anxiety, and metabolic disease—supporting a longer, healthier life.

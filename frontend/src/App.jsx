@@ -133,6 +133,7 @@ export default function App() {
     historyLimit: 240,
   });
   const liveStream = useMuseStream(WS_URL);
+  const [clientId, setClientId] = useState(null);
   const [breathingPhase, setBreathingPhase] = useState(BREATHING_PHASES[0]);
   const breathingTimeoutRef = useRef(null);
   const deviationNotificationRef = useRef(null);
@@ -142,6 +143,9 @@ export default function App() {
     }
     return Notification.permission;
   });
+  const [calendarStatus, setCalendarStatus] = useState('disconnected');
+  const [calendarEvents, setCalendarEvents] = useState([]);
+  const [agentMessage, setAgentMessage] = useState(null);
 
   const monitorReady = Boolean(baseline && monitorResult);
   const monitorStatusLabel = {
@@ -210,6 +214,23 @@ export default function App() {
   }, [isCalculatingBaseline]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const key = 'stressCompassClientId';
+    let id = window.localStorage.getItem(key);
+    if (!id) {
+      if (window.crypto?.randomUUID) {
+        id = window.crypto.randomUUID();
+      } else {
+        id = `client-${Date.now()}`;
+      }
+      window.localStorage.setItem(key, id);
+    }
+    setClientId(id);
+  }, []);
+
+  useEffect(() => {
     if (typeof window === 'undefined' || !('Notification' in window)) {
       setNotificationPermission('unsupported');
       return;
@@ -230,6 +251,108 @@ export default function App() {
         setNotificationPermission(Notification.permission);
       });
   };
+
+  const fetchCalendarEvents = async () => {
+    if (!clientId) {
+      return;
+    }
+    try {
+      setCalendarStatus('connecting');
+      const response = await fetch(`${API_URL}/calendar/events?client_id=${clientId}`);
+      if (!response.ok) {
+        throw new Error((await response.json()).detail || 'Failed to read calendar events');
+      }
+      const data = await response.json();
+      setCalendarEvents(data.events || []);
+      setCalendarStatus('connected');
+    } catch (error) {
+      console.error('Calendar fetch failed', error);
+      setCalendarStatus('error');
+    }
+  };
+
+  const triggerAgent = async () => {
+    if (!monitorResult?.composite_score || !clientId) {
+      return;
+    }
+    try {
+      setAgentMessage('Running agent...');
+      const response = await fetch(`${API_URL}/agent/mock-trigger?client_id=${clientId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ composite_score: monitorResult.composite_score }),
+      });
+      if (!response.ok) {
+        throw new Error((await response.json()).detail || 'Agent trigger failed');
+      }
+      const data = await response.json();
+      setAgentMessage(
+        data.status === 'scheduled'
+          ? `Intervention scheduled in ${Math.round(data.delay_seconds)}s.`
+          : 'Intervention sent.'
+      );
+      if (data.current_event) {
+        setCalendarEvents((prev) => {
+          if (prev?.length) {
+            return prev;
+          }
+          return [data.current_event, data.next_event].filter(Boolean);
+        });
+      }
+    } catch (error) {
+      console.error('Agent trigger failed', error);
+      setAgentMessage('Failed to trigger agent.');
+    }
+  };
+
+  const connectCalendar = async () => {
+    if (!clientId) {
+      return;
+    }
+    try {
+      setCalendarStatus('connecting');
+      const response = await fetch(`${API_URL}/calendar/connect/start?client_id=${clientId}`);
+      if (!response.ok) {
+        throw new Error('Failed to start OAuth flow');
+      }
+      const data = await response.json();
+      const authWindow = window.open(data.auth_url, '_blank', 'width=500,height=700');
+      const poll = window.setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API_URL}/calendar/status?client_id=${clientId}`);
+          const statusData = await statusRes.json();
+          if (statusData.connected) {
+            window.clearInterval(poll);
+            if (authWindow) {
+              authWindow.close();
+            }
+            setCalendarStatus('connected');
+            fetchCalendarEvents();
+          }
+        } catch (error) {
+          console.error('Status check failed', error);
+        }
+      }, 2000);
+    } catch (error) {
+      console.error('Calendar connect failed', error);
+      setCalendarStatus('error');
+    }
+  };
+
+  useEffect(() => {
+    if (!clientId) {
+      return;
+    }
+    fetch(`${API_URL}/calendar/status?client_id=${clientId}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.connected) {
+          setCalendarStatus('connected');
+          fetchCalendarEvents();
+        }
+      })
+      .catch(() => {});
+  }, [clientId]);
 
   useEffect(() => {
     if (!monitorResult?.alerts?.length) {
@@ -392,6 +515,35 @@ export default function App() {
             <span className="muted small">Allow notifications in your browser settings.</span>
           )}
         </div>
+        <div className="calendar-settings">
+          <span>Google Calendar:</span>
+          <span className={`badge ${calendarStatus === 'connected' ? 'badge-success' : ''} ${calendarStatus === 'error' ? 'badge-error' : ''}`.trim()}>
+            {calendarStatus === 'connected'
+              ? 'Connected'
+              : calendarStatus === 'connecting'
+                ? 'Connecting...'
+                : calendarStatus === 'error'
+                  ? 'Failed'
+                  : 'Disconnected'}
+          </span>
+          <button
+            type="button"
+            className="ghost"
+            onClick={calendarStatus === 'connected' ? fetchCalendarEvents : connectCalendar}
+            disabled={!clientId}
+          >
+            {calendarStatus === 'connected' ? 'Refresh calendar' : 'Connect calendar'}
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={triggerAgent}
+            disabled={!monitorResult?.composite_score || calendarStatus !== 'connected'}
+          >
+            Mock stress trigger
+          </button>
+        </div>
+        {agentMessage && <p className="muted" style={{ marginBottom: '0.5rem' }}>{agentMessage}</p>}
         {monitorError && <p className="error">{monitorError}</p>}
         {monitorResult?.alerts?.length > 0 && (
           <div className="alert-panel">
@@ -425,6 +577,23 @@ export default function App() {
           </div>
         ) : (
           <p className="muted">Baseline calibration must finish before deviation detection starts.</p>
+        )}
+        {calendarEvents.length > 0 && (
+          <div className="calendar-events">
+            <h3>Today's events</h3>
+            <ul>
+              {calendarEvents.slice(0, 3).map((event) => (
+                <li key={`${event.summary}-${event.start}`}>
+                  <strong>{event.summary}</strong>
+                  <span>
+                    {new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    {' - '}
+                    {new Date(event.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
       </div>
 
