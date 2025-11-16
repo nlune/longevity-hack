@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import LiveWaves from './components/LiveWaves.jsx';
 import HRVDeviationChart from './components/HRVDeviationChart.jsx';
+import CompassIcon from './components/CompassIcon.jsx';
 import { useBaselineMonitor } from './hooks/useBaselineMonitor.js';
+import { useMuseStream } from './hooks/useMuseStream.js';
 import { deriveMindStates } from './utils/mindState.js';
 
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws/metrics';
@@ -15,15 +17,13 @@ const BREATHING_PHASES = [
   { key: 'exhale', duration: 4000 },
   { key: 'hold', duration: 2000 },
 ];
-const HEARTBEAT_INTERVAL_MS = 60000;
-const NEGATIVE_ALERT_METRICS = new Set([
+const NEGATIVE_ALERT_METRICS = new Set(['hrv_rmssd', 'hrv_sdnn']);
+const POSITIVE_ALERT_METRICS = new Set([
   'alpha_relaxation',
   'theta_relaxation',
   'beta_concentration',
-  'hrv_rmssd',
-  'hrv_sdnn',
+  'hrv_lf_hf',
 ]);
-const POSITIVE_ALERT_METRICS = new Set(['hrv_lf_hf']);
 
 function formatNumber(value) {
   if (value === undefined || value === null || Number.isNaN(value)) {
@@ -57,6 +57,37 @@ function getDeviationBadge(value) {
 
 function readableMetricName(name) {
   return name.replace(/_/g, ' ');
+}
+
+const METRIC_HINTS = {
+  alpha_relaxation: {
+    label: 'Alpha calm',
+    hint: 'Higher = calm, eyes-open relaxation',
+  },
+  theta_relaxation: {
+    label: 'Theta relaxation',
+    hint: 'Higher = deeper relaxation/creativity',
+  },
+  beta_concentration: {
+    label: 'Beta concentration',
+    hint: 'Higher = analytical engagement',
+  },
+  hrv_rmssd: {
+    label: 'RMSSD',
+    hint: 'Higher = resilient parasympathetic tone',
+  },
+  hrv_sdnn: {
+    label: 'SDNN',
+    hint: 'Higher = overall HRV stability',
+  },
+  hrv_lf_hf: {
+    label: 'LF/HF',
+    hint: 'Higher = sympathetic/stress load',
+  },
+};
+
+function metricLabel(key) {
+  return METRIC_HINTS[key]?.label || readableMetricName(key);
 }
 
 function metricDirection(metric) {
@@ -101,6 +132,7 @@ export default function App() {
     monitorInterval: MONITOR_INTERVAL,
     historyLimit: 240,
   });
+  const liveStream = useMuseStream(WS_URL);
   const [breathingPhase, setBreathingPhase] = useState(BREATHING_PHASES[0]);
   const breathingTimeoutRef = useRef(null);
   const deviationNotificationRef = useRef(null);
@@ -110,10 +142,6 @@ export default function App() {
     }
     return Notification.permission;
   });
-  const lastTestNotificationRef = useRef(0);
-  const heartbeatIntervalRef = useRef(null);
-  const [heartbeatEnabled, setHeartbeatEnabled] = useState(false);
-  const [notificationInfo, setNotificationInfo] = useState('');
 
   const monitorReady = Boolean(baseline && monitorResult);
   const monitorStatusLabel = {
@@ -192,67 +220,15 @@ export default function App() {
   const requestNotificationPermission = () => {
     if (typeof window === 'undefined' || !('Notification' in window)) {
       setNotificationPermission('unsupported');
-      setNotificationInfo('Notifications are not supported in this browser.');
       return;
     }
     Notification.requestPermission()
       .then((permission) => {
         setNotificationPermission(permission);
-        setNotificationInfo(
-          permission === 'granted'
-            ? 'Desktop alerts enabled. You can now use test or minute ping.'
-            : permission === 'denied'
-              ? 'Notifications blocked. Allow them in the browser settings.'
-              : 'Permission request dismissed.'
-        );
       })
       .catch(() => {
-        const fallback = Notification.permission;
-        setNotificationPermission(fallback);
-        setNotificationInfo('Unable to request notification permission.');
+        setNotificationPermission(Notification.permission);
       });
-  };
-
-  const ensurePermission = () => {
-    if (typeof window === 'undefined' || !('Notification' in window)) {
-      setNotificationInfo('Notifications are not supported in this browser.');
-      return false;
-    }
-    if (notificationPermission !== 'granted') {
-      setNotificationInfo('Enable alerts first, then try again.');
-      return false;
-    }
-    return true;
-  };
-
-  const triggerTestNotification = () => {
-    if (!ensurePermission()) {
-      return;
-    }
-    const now = Date.now();
-    if (now - lastTestNotificationRef.current < 2000) {
-      return;
-    }
-    lastTestNotificationRef.current = now;
-    try {
-      new Notification('Notification test', {
-        body: 'If you can read this, desktop alerts are ready.',
-        tag: 'deviation-test',
-      });
-    } catch (error) {
-      console.error('Unable to show test notification', error);
-    }
-  };
-
-  const toggleHeartbeat = () => {
-    if (heartbeatEnabled) {
-      setHeartbeatEnabled(false);
-      return;
-    }
-    if (!ensurePermission()) {
-      return;
-    }
-    setHeartbeatEnabled(true);
   };
 
   useEffect(() => {
@@ -283,43 +259,20 @@ export default function App() {
     });
   }, [monitorResult, notificationPermission]);
 
-  useEffect(() => {
-    if (notificationPermission !== 'granted' && heartbeatEnabled) {
-      setHeartbeatEnabled(false);
-    }
-  }, [notificationPermission, heartbeatEnabled]);
-
-  useEffect(() => {
-    if (!heartbeatEnabled || notificationPermission !== 'granted') {
-      if (heartbeatIntervalRef.current) {
-        window.clearInterval(heartbeatIntervalRef.current);
-        heartbeatIntervalRef.current = null;
-      }
-      return;
-    }
-    heartbeatIntervalRef.current = window.setInterval(() => {
-      try {
-        new Notification('Monitoring pulse', {
-          body: `Still watching metrics (${new Date().toLocaleTimeString()})`,
-          tag: 'monitor-heartbeat',
-          silent: true,
-        });
-      } catch (error) {
-        console.error('Failed to send heartbeat notification', error);
-      }
-    }, HEARTBEAT_INTERVAL_MS);
-    return () => {
-      if (heartbeatIntervalRef.current) {
-        window.clearInterval(heartbeatIntervalRef.current);
-        heartbeatIntervalRef.current = null;
-      }
-    };
-  }, [heartbeatEnabled, notificationPermission]);
-
   return (
     <div className="app-shell">
+      <header className="app-header">
+        <div className="logo-mark">
+          <CompassIcon size={52} />
+        </div>
+        <div className="app-header-text">
+          <h1>Stress Compass</h1>
+          <p>Agentic awareness for calmer, longer workdays.</p>
+        </div>
+      </header>
+
       <div className="card baseline-card">
-        <h1>Baseline Calibration</h1>
+        <h2>Baseline Calibration</h2>
         <p>
           We run a one-minute capture to understand your personal alpha/beta ratios and heart-rate variability. Keep the
           headset steady and relax while the baseline is recorded.
@@ -337,41 +290,58 @@ export default function App() {
         </div>
 
         {isCalculatingBaseline && (
-          <>
-            <div className="baseline-progress">
-              <div className="progress-bar">
-                <div
-                  className="progress-bar-fill"
-                  style={{ width: `${baselineProgressPercent}%` }}
-                />
-              </div>
-              <div className="progress-label">
-                <span>{formatDuration(baselineElapsed)}</span>
-                <span>{formatDuration(BASELINE_DURATION)}</span>
+          <div className="baseline-progress">
+            <div className="progress-bar">
+              <div
+                className="progress-bar-fill"
+                style={{ width: `${baselineProgressPercent}%` }}
+              />
+            </div>
+            <div className="progress-label">
+              <span>{formatDuration(baselineElapsed)}</span>
+              <span>{formatDuration(BASELINE_DURATION)}</span>
+            </div>
+          </div>
+        )}
+        {isCalculatingBaseline && (
+          <div className="baseline-visualizer active">
+            <div className="baseline-visualizer-inner">
+              <LiveWaves
+                url={WS_URL}
+                width={720}
+                height={240}
+                showStatus={false}
+                showNotifications={false}
+                showLegend={false}
+                showMetricGrid={false}
+                className="compact-waves"
+                enabled
+              />
+              <div
+                className="baseline-breath-shadow active"
+                data-phase={breathingPhase.key}
+              />
+              <div className="baseline-visualizer-overlay active">
+                <div className="baseline-timer">
+                  <div
+                    className="baseline-timer-ring"
+                    style={{ background: `conic-gradient(#22d3ee ${baselineProgressPercent * 3.6}deg, rgba(148, 163, 184, 0.2) 0deg)` }}
+                  >
+                    <span>{formatDuration(Math.max(BASELINE_DURATION - baselineElapsed, 0))}</span>
+                  </div>
+                  <div className="baseline-timer-label">Time left</div>
+                </div>
+                <div>
+                  <div className="overlay-title">Recording baseline...</div>
+                  <div className="overlay-subtitle">Stay relaxed and keep still</div>
+                </div>
               </div>
             </div>
-            <div className="baseline-visualizer">
-              <div className="baseline-visualizer-inner">
-                {isCalculatingBaseline && (
-                  <LiveWaves
-                    url={WS_URL}
-                    width={720}
-                    height={240}
-                    showStatus={false}
-                    showNotifications={false}
-                    showLegend={false}
-                    showMetricGrid={false}
-                    className="compact-waves"
-                  />
-                )}
-                <div className="baseline-breath-shadow" data-phase={breathingPhase.key} />
-              </div>
-              <div className="baseline-visualizer-caption">
-                <span>Slow, steady breaths</span>
-                <span>{formatDuration(baselineElapsed)} / {formatDuration(BASELINE_DURATION)}</span>
-              </div>
+            <div className="baseline-visualizer-caption">
+              <span>Slow, steady breaths</span>
+              <span>{formatDuration(baselineElapsed)} / {formatDuration(BASELINE_DURATION)}</span>
             </div>
-          </>
+          </div>
         )}
 
         {baselineError && <p className="error">{baselineError}</p>}
@@ -384,7 +354,7 @@ export default function App() {
             <div className="baseline-grid">
               {Object.entries(baseline.metrics).map(([key, stats]) => (
                 <div key={key} className="metric compact">
-                  <div className="metric-label">{readableMetricName(key)}</div>
+                  <div className="metric-label">{metricLabel(key)}</div>
                   <div className="metric-value">{formatNumber(stats.mean)}</div>
                   <div className="metric-subvalue">σ {formatNumber(stats.std)}</div>
                 </div>
@@ -418,27 +388,8 @@ export default function App() {
               Enable alerts
             </button>
           )}
-          {notificationPermission === 'granted' && (
-            <button type="button" className="ghost" onClick={triggerTestNotification}>
-              Test notification
-            </button>
-          )}
-          {notificationPermission === 'granted' && (
-            <button
-              type="button"
-              className={`ghost ${heartbeatEnabled ? 'active' : ''}`.trim()}
-              onClick={toggleHeartbeat}
-            >
-              Minute ping: {heartbeatEnabled ? 'On' : 'Off'}
-            </button>
-          )}
           {notificationPermission === 'denied' && (
             <span className="muted small">Allow notifications in your browser settings.</span>
-          )}
-          {notificationInfo && (
-            <span className="muted small" style={{ flexBasis: '100%' }}>
-              {notificationInfo}
-            </span>
           )}
         </div>
         {monitorError && <p className="error">{monitorError}</p>}
@@ -462,9 +413,12 @@ export default function App() {
                   key={key}
                   className={`metric deviation ${badge} ${positiveEvent ? 'deviation-positive' : ''}`.trim()}
                 >
-                  <div className="metric-label">{readableMetricName(key)}</div>
+                  <div className="metric-label">{metricLabel(key)}</div>
                   <div className="metric-value">{formatNumber(value)}</div>
                   <div className="metric-subvalue">{formatDeviation(deviation)}</div>
+                  {METRIC_HINTS[key]?.hint && (
+                    <div className="metric-hint">{METRIC_HINTS[key].hint}</div>
+                  )}
                 </div>
               );
             })}
@@ -481,7 +435,10 @@ export default function App() {
             ? `Tracking combined neuro + HRV deviation over the last ${hrvWindowLabel}.`
             : 'Begin monitoring to populate deviation trends.'}
         </p>
-        <HRVDeviationChart history={monitorHistory} />
+        <HRVDeviationChart
+          history={monitorHistory}
+          highlightValue={monitorResult?.composite_score ?? null}
+        />
         <div className="mindstate-grid">
           {mindStates.map((state) => (
             <div key={state.key} className={`mindstate-card ${state.key}`}>
@@ -506,17 +463,7 @@ export default function App() {
         <h2>Muse Metrics Stream</h2>
         <p>Live band powers and derived relaxation/concentration metrics from the FastAPI backend.</p>
         <div className="graph-visualizer">
-          {isCalculatingBaseline ? (
-            <div className="graph-placeholder">
-              <span className="pulse-dot" />
-              <div>
-                <div className="overlay-title">Baseline capture in progress</div>
-                <div className="overlay-subtitle">We will resume the main stream once calibration ends.</div>
-              </div>
-            </div>
-          ) : (
-            <LiveWaves url={WS_URL} />
-          )}
+          <LiveWaves url={WS_URL} stream={liveStream} />
         </div>
       </div>
     </div>

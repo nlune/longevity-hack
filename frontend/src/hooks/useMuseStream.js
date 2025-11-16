@@ -2,13 +2,19 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 export const DEFAULT_BANDS = ['delta', 'theta', 'alpha', 'beta'];
 
-export function useMuseStream(url, { maxPoints = 180 } = {}) {
+export function useMuseStream(url, { maxPoints = 180, enabled = true } = {}) {
   const [points, setPoints] = useState([]);
   const [status, setStatus] = useState('connecting');
   const [error, setError] = useState(null);
   const socketRef = useRef(null);
 
   useEffect(() => {
+    if (!enabled) {
+      setStatus('idle');
+      setPoints([]);
+      setError(null);
+      return () => {};
+    }
     const socket = new WebSocket(url);
     socketRef.current = socket;
 
@@ -43,7 +49,10 @@ export function useMuseStream(url, { maxPoints = 180 } = {}) {
     return () => {
       socket.close();
     };
-  }, [url, maxPoints]);
+    return () => {
+      socket.close();
+    };
+  }, [url, maxPoints, enabled]);
 
   const latest = points[points.length - 1];
   const bandSeries = useMemo(() => {

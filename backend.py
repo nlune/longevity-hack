@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import warnings
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import neurokit2 as nk
 from neurokit2.misc import NeuroKitWarning
 from pydantic import BaseModel, Field
 from pylsl import StreamInlet, resolve_byprop
+import json
+import subprocess
 
 import utils
 
@@ -21,8 +24,16 @@ BAND_NAMES = ["delta", "theta", "alpha", "beta"]
 METRIC_NAMES = ["alpha_relaxation", "beta_concentration", "theta_relaxation"]
 HRV_METRIC_NAMES = ["hrv_rmssd", "hrv_sdnn", "hrv_lf_hf"]
 DEFAULT_BASELINE_SECONDS = 60
-NEGATIVE_ALERT_METRICS = {"alpha_relaxation", "theta_relaxation", "beta_concentration", "hrv_rmssd", "hrv_sdnn"}
-POSITIVE_ALERT_METRICS = {"hrv_lf_hf"}
+NEGATIVE_ALERT_METRICS = {"hrv_rmssd", "hrv_sdnn"}
+POSITIVE_ALERT_METRICS = set(METRIC_NAMES + ["hrv_lf_hf"]) - NEGATIVE_ALERT_METRICS
+COMPOSITE_WEIGHTS = {
+    'alpha_relaxation': 1.0,
+    'theta_relaxation': 0.8,
+    'beta_concentration': 1.0,
+    'hrv_rmssd': 1.2,
+    'hrv_sdnn': 1.0,
+    'hrv_lf_hf': 0.8,
+}
 
 
 class MetricStats(BaseModel):
@@ -57,6 +68,13 @@ class MonitorResponse(BaseModel):
     alerts: List[str]
     sample_count: int
     hrv_sample_seconds: float
+    composite_score: float
+
+
+class NotificationRequest(BaseModel):
+    message: str
+    title: str = 'Stress Compass'
+    delay_seconds: float = Field(0.0, ge=0.0, le=3600.0)
 
 
 class MuseMetricsSession:
@@ -418,9 +436,11 @@ def compute_deviations(
     current_metrics: Dict[str, float],
     baseline: BaselineResponse,
     threshold: float,
-) -> Tuple[Dict[str, float], List[str]]:
+) -> Tuple[Dict[str, float], List[str], float]:
     deviations: Dict[str, float] = {}
     alerts: List[str] = []
+    composite_sum = 0.0
+    weight_sum = 0.0
     for metric, stats in baseline.metrics.items():
         value = current_metrics.get(metric)
         if value is None:
@@ -431,22 +451,38 @@ def compute_deviations(
         else:
             z_score = 0.0
         deviations[metric] = float(z_score)
-        if std is None or std <= 1e-6:
+        if std is None or std <= 1e-6 or math.isnan(z_score):
             continue
-        direction = 'positive'
+
         if metric in NEGATIVE_ALERT_METRICS:
-            direction = 'negative'
-        elif metric in POSITIVE_ALERT_METRICS:
-            direction = 'positive'
-        if direction == 'negative' and z_score <= -threshold:
+            stress_score = z_score  # drops (negative z) should stay negative
+        else:
+            stress_score = -z_score  # spikes become negative values
+
+        weight = COMPOSITE_WEIGHTS.get(metric)
+        if weight:
+            composite_sum += stress_score * weight
+            weight_sum += weight
+
+        if metric in NEGATIVE_ALERT_METRICS and z_score <= -threshold:
             alerts.append(
                 f"{metric} dropped -{abs(z_score):.1f}σ (current={value:.2f}, baseline={stats.mean:.2f})"
             )
-        elif direction == 'positive' and z_score >= threshold:
+        elif metric in POSITIVE_ALERT_METRICS and z_score >= threshold:
             alerts.append(
                 f"{metric} spiked +{z_score:.1f}σ (current={value:.2f}, baseline={stats.mean:.2f})"
             )
-    return deviations, alerts
+    composite_score = float(composite_sum / weight_sum) if weight_sum > 0 else 0.0
+    return deviations, alerts, composite_score
+
+
+async def _dispatch_notification(message: str, title: str, delay_seconds: float) -> None:
+    await asyncio.sleep(max(0.0, delay_seconds))
+    script = f'display notification {json.dumps(message)} with title {json.dumps(title)}'
+    try:
+        subprocess.run(['osascript', '-e', script], check=True)
+    except Exception as exc:  # pragma: no cover
+        print(f'Failed to deliver notification: {exc}')
 
 
 app = FastAPI(title='Muse Metrics API', version='0.1.0')
@@ -498,7 +534,7 @@ async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    deviations, alerts = compute_deviations(
+    deviations, alerts, composite_score = compute_deviations(
         current_metrics=current_metrics,
         baseline=request.baseline,
         threshold=request.deviation_threshold,
@@ -511,7 +547,21 @@ async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
         alerts=alerts,
         sample_count=sample_count,
         hrv_sample_seconds=hrv_seconds,
+        composite_score=composite_score,
     )
+
+
+@app.post('/notify')
+async def schedule_notification(request: NotificationRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    if request.message.strip() == '':
+        raise HTTPException(status_code=400, detail='Message must not be empty.')
+    background_tasks.add_task(
+        _dispatch_notification,
+        request.message,
+        request.title,
+        request.delay_seconds,
+    )
+    return {'status': 'scheduled', 'delay_seconds': request.delay_seconds}
 
 
 @app.websocket('/ws/metrics')

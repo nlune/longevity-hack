@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { computeMindStateScores } from '../utils/mindState.js';
 
 const SERIES = [
-  { key: 'hrvComposite', label: 'HRV composite', color: '#22c55e' },
+  { key: 'stress_index', label: 'Stress index', color: '#f43f5e', primary: true },
   { key: 'relaxation', label: 'Relaxation proxy', color: '#0ea5e9' },
   { key: 'engagement', label: 'Engagement proxy', color: '#6366f1' },
   { key: 'stress', label: 'Stress proxy', color: '#f97316' },
@@ -23,7 +23,14 @@ function formatTimeLabel(timestamp) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-export default function HRVDeviationChart({ history = [], width = 720, height = 220 }) {
+function formatSigma(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '--';
+  }
+  return `${value >= 0 ? '+' : ''}${value.toFixed(2)}`;
+}
+
+export default function HRVDeviationChart({ history = [], width = 720, height = 220, highlightValue = null }) {
   const { paths, zeroY, ticks, latestValues, timeRangeMinutes } = useMemo(() => {
     if (!history.length) {
       return { paths: [], zeroY: height / 2, ticks: [], latestValues: {}, timeRangeMinutes: 0 };
@@ -45,13 +52,15 @@ export default function HRVDeviationChart({ history = [], width = 720, height = 
 
     const paths = SERIES.map(({ key, ...rest }) => {
       const commands = history.map((point, index) => {
-        const scores = computeMindStateScores(point?.deviations || {});
-        const deviation =
-          key === 'hrvComposite'
-            ? scores.hrvComposite
-            : scores[key];
+        let sigma = 0;
+        if (key === 'stress_index') {
+          sigma = point?.composite_score ?? 0;
+        } else {
+          const scores = computeMindStateScores(point?.deviations || {});
+          sigma = (scores[key] ?? 0) * 3; // convert normalized score to sigma range
+        }
         const x = index * step;
-        const y = valueToY(deviation * 3);
+        const y = valueToY(sigma);
         return `${index === 0 ? 'M' : 'L'} ${x.toFixed(2)} ${y.toFixed(2)}`;
       });
       return { key, path: commands.join(' '), ...rest };
@@ -65,13 +74,14 @@ export default function HRVDeviationChart({ history = [], width = 720, height = 
       return { x, label: formatTimeLabel(timestamp) };
     });
 
-    const latestDeviation = history[history.length - 1]?.deviations ?? {};
+    const latestPoint = history[history.length - 1];
+    const latestDeviation = latestPoint?.deviations ?? {};
     const latestScores = computeMindStateScores(latestDeviation);
     const latestValues = {
-      hrvComposite: latestScores.hrvComposite,
-      relaxation: latestScores.relaxation,
-      engagement: latestScores.engagement,
-      stress: latestScores.stress,
+      stress_index: latestPoint?.composite_score ?? 0,
+      relaxation: (latestScores.relaxation ?? 0) * 3,
+      engagement: (latestScores.engagement ?? 0) * 3,
+      stress: (latestScores.stress ?? 0) * 3,
     };
 
     return { paths, zeroY: valueToY(0), ticks, latestValues, timeRangeMinutes };
@@ -117,18 +127,28 @@ export default function HRVDeviationChart({ history = [], width = 720, height = 
           stroke="rgba(248, 250, 252, 0.4)"
           strokeDasharray="4 4"
         />
-        {paths.map(({ key, path, color }) => (
+        {paths.map(({ key, path, color, primary }) => (
           <path
             key={key}
             d={path}
             fill="none"
             stroke={color}
-            strokeWidth={2.5}
+            strokeWidth={primary ? 3.5 : 1.5}
             strokeLinejoin="round"
             strokeLinecap="round"
+            opacity={primary ? 1 : 0.6}
+            className={primary ? 'hrv-primary-line' : ''}
           />
         ))}
       </svg>
+      {highlightValue !== null && Number.isFinite(highlightValue) && (
+        <div className="hrv-highlight">
+          <span>Stress index</span>
+          <strong>
+            {formatSigma(highlightValue)}σ
+          </strong>
+        </div>
+      )}
       <div className="hrv-chart-footer">
         <div className="hrv-legend">
           {SERIES.map((series) => (
@@ -137,7 +157,7 @@ export default function HRVDeviationChart({ history = [], width = 720, height = 
               <span>{series.label}</span>
               <span className="legend-value">
                 {latestValues[series.key] !== undefined
-                  ? clampZ(latestValues[series.key] * 3).toFixed(1)
+                  ? clampZ(latestValues[series.key]).toFixed(1)
                   : '--'}
                 σ
               </span>

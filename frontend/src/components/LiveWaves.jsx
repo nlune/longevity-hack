@@ -9,6 +9,12 @@ const BAND_COLORS = {
   beta: '#f472b6',
 };
 
+const METRIC_LABELS = {
+  alpha_relaxation: 'Alpha calm',
+  theta_relaxation: 'Theta relaxation',
+  beta_concentration: 'Beta focus',
+};
+
 function formatNumber(value) {
   if (value === undefined || value === null || Number.isNaN(value)) {
     return '--';
@@ -25,8 +31,12 @@ export default function LiveWaves({
   showLegend = true,
   showMetricGrid = true,
   className = '',
+  enabled = true,
+  stream,
 }) {
-  const { bandSeries, latest, status, error } = useMuseStream(url);
+  const shouldUseInternal = !stream;
+  const internalStream = useMuseStream(url, { enabled: shouldUseInternal && enabled });
+  const { bandSeries, latest, status, error } = stream || internalStream;
 
   // Enable browser notifications for low concentration
   const { permissionStatus, lastAlertTime } = useConcentrationNotifications(latest, 0);
@@ -61,6 +71,7 @@ export default function LiveWaves({
     online: 'Streaming from backend',
     disconnected: 'Disconnected',
     error: 'Connection error',
+    idle: 'Paused',
   }[status] || 'Idle';
 
   return (
@@ -179,7 +190,7 @@ export default function LiveWaves({
         <div className="metrics-grid">
           {Object.entries(latest.metrics).map(([key, value]) => (
             <div key={key} className="metric">
-              <div className="metric-label">{key.replace('_', ' ')}</div>
+              <div className="metric-label">{METRIC_LABELS[key] || key.replace('_', ' ')}</div>
               <div className="metric-value">{formatNumber(value)}</div>
             </div>
           ))}
