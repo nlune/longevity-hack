@@ -100,27 +100,6 @@ export default function LiveWaves({
              permissionStatus === 'denied' ? 'Blocked' :
              permissionStatus === 'requesting' ? 'Requesting...' : 'Checking...'}
           </span>
-          {permissionStatus === 'granted' && (
-            <button
-              onClick={() => {
-                new Notification('Test Notification 🧪', {
-                  body: 'If you see this, notifications are working!',
-                  tag: 'test-notification',
-                });
-              }}
-              style={{
-                marginLeft: '0.5rem',
-                padding: '0.25rem 0.5rem',
-                fontSize: '0.85em',
-                cursor: 'pointer',
-                borderRadius: '4px',
-                border: '1px solid #ccc',
-                background: '#f0f0f0',
-              }}
-            >
-              Test Notification
-            </button>
-          )}
           {lastAlertTime && (
             <span className="badge" style={{ marginLeft: '0.5rem' }}>
               Last alert: {lastAlertTime}

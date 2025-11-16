@@ -286,11 +286,11 @@ export default function App() {
         throw new Error((await response.json()).detail || 'Agent trigger failed');
       }
       const data = await response.json();
-      setAgentMessage(
+      const statusText =
         data.status === 'scheduled'
           ? `Intervention scheduled in ${Math.round(data.delay_seconds)}s.`
-          : 'Intervention sent.'
-      );
+          : 'Intervention sent.';
+      setAgentMessage(`${statusText} Message: ${data.message}`);
       if (data.current_event) {
         setCalendarEvents((prev) => {
           if (prev?.length) {
@@ -390,7 +390,7 @@ export default function App() {
         </div>
         <div className="app-header-text">
           <h1>Stress Compass</h1>
-          <p>Agentic awareness for calmer, longer workdays.</p>
+          <p>regular awareness for calmer days.</p>
         </div>
       </header>
 
@@ -509,6 +509,28 @@ export default function App() {
           {notificationPermission === 'default' && (
             <button type="button" className="ghost" onClick={requestNotificationPermission}>
               Enable alerts
+            </button>
+          )}
+          {notificationPermission === 'granted' && (
+            <button
+              type="button"
+              className="ghost"
+              onClick={async () => {
+                try {
+                  await fetch(`${API_URL}/notify`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      message: 'Stress Compass test notification',
+                      delay_seconds: 0,
+                    }),
+                  });
+                } catch (error) {
+                  console.error('Failed to request test notification', error);
+                }
+              }}
+            >
+              Test desktop notification
             </button>
           )}
           {notificationPermission === 'denied' && (

@@ -635,18 +635,19 @@ def _generate_intervention_message(
         f'Next event: {next_event.summary if next_event else "None"}',
     ]
     prompt = (
-        'You are Stress Compass, a workplace wellbeing guide. '
-        'Given the following context, write a short actionable intervention (max 2 sentences) '
+        'You are Stress Compass, a workplace wellbeing guide. Decide what intervention the user should use to regulate their stress levels right now.'
+        'Given the following context, write a short actionable intervention. 2-3 sentences max'
         'that helps the user self-regulate. Mention if they are currently in a meeting and suggest '
         'a gentle strategy. Context:\n' + '\n'.join(context)
     )
     try:
         response = client.chat.completions.create(
-            model='mixtral-8x7b-32768',
+            model='llama-3.1-8b-instant',
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.3,
             max_tokens=120,
         )
+        print(response)
         return response.choices[0].message.content.strip()
     except Exception as exc:  # pragma: no cover
         print(f'Groq request failed: {exc}')
@@ -760,8 +761,6 @@ async def mock_trigger(request: AgentTriggerRequest, client_id: str):
 
     message = _generate_intervention_message(request.composite_score, current_event, next_event)
     delay = 0.0
-    if current_event and current_event.status != 'transparent':
-        delay = max(0.0, current_event.end_ts - now_ts)
     asyncio.create_task(_dispatch_notification(message, 'Stress Compass', delay))
     return {
         'status': 'scheduled' if delay > 0 else 'sent',
