@@ -22,6 +22,7 @@ export function useBaselineMonitor(
     hrvWindowSeconds = DEFAULT_HRV_WINDOW_SECONDS,
     hrvStepSeconds = DEFAULT_HRV_STEP_SECONDS,
     historyLimit = 180,
+    clientId,
   } = {}
 ) {
   const [baseline, setBaseline] = useState(null);
@@ -132,7 +133,8 @@ export function useBaselineMonitor(
       setMonitorError(null);
 
       try {
-        const response = await fetch(`${apiUrl}/monitor`, {
+        const url = clientId ? `${apiUrl}/monitor?client_id=${clientId}` : `${apiUrl}/monitor`;
+        const response = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

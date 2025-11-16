@@ -35,6 +35,7 @@ _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=t
   - *Stress / scatter* weighs LF/HF against HRV RMSSD to detect sympathetic spikes.
   A weighted composite of all deviations (positive spikes inverted, negative drops preserved) becomes the **stress index**, the single number used for current alerts and future agentic logic.
 - **Nudges, not nags:** Positive deviations (e.g., calmer-than-usual alpha or steadier HRV) appear in green cards and history charts. Negative deviations (stress spikes, engagement drops, HRV dips) tint red/orange and may trigger notifications so you can intervene early.
+- **Agentic trigger:** When the stress index crosses a configurable threshold (default 1.5σ) the backend agent automatically checks Google Calendar (current/next meetings) and crafts an intervention via Groq. If you’re in a meeting the notification can be delayed; otherwise it fires immediately. A manual mock trigger remains available for demos.
 
 ### Calendar & Agent Integration
 
@@ -47,6 +48,6 @@ _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=t
    - Optional: `GOOGLE_TOKEN_STORE` to change where OAuth tokens are cached locally.
 3. Provide a `GROQ_API_KEY` so the agent can craft contextual interventions.
 4. In the UI, click **Connect calendar**. A Google consent window opens; select your calendar account. Once connected, you’ll see today’s events listed and the agent can reason about current/next meetings.
-5. Use **Mock stress trigger** to simulate a high stress index. The backend agent checks current/next events, decides whether to delay the notification (e.g., during a meeting), and schedules the desktop intervention via `/notify`.
+5. Use **Mock stress trigger** at the bottom of the UI only if you need to simulate a high stress index manually. Normally the agent fires automatically whenever the live stress index crosses the threshold. The backend agent checks current/next events, decides whether to delay the notification (e.g., during a meeting), and schedules the desktop intervention via `/notify`.
 
 By cycling between awareness and action throughout the day, Stress Compass helps dial down chronic sympathetic load—the exact pattern linked to burnout, anxiety, and metabolic disease—supporting a longer, healthier life.

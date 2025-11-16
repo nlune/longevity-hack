@@ -46,6 +46,10 @@ COMPOSITE_WEIGHTS = {
 CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 TOKEN_STORE_PATH = os.environ.get('GOOGLE_TOKEN_STORE', 'calendar_tokens.json')
 PENDING_STATES: Dict[str, str] = {}
+STRESS_TRIGGER_THRESHOLD = float(os.environ.get('STRESS_TRIGGER_THRESHOLD', 1.5))
+AGENT_COOLDOWN_SECONDS = float(os.environ.get('AGENT_COOLDOWN_SECONDS', 300))
+LAST_AGENT_TRIGGER: Dict[str, float] = {}
+THRESHOLD_STORE: Dict[str, float] = {}
 
 
 load_dotenv()
@@ -84,6 +88,7 @@ class MonitorResponse(BaseModel):
     sample_count: int
     hrv_sample_seconds: float
     composite_score: float
+    auto_triggered: bool = False
 
 
 class NotificationRequest(BaseModel):
@@ -108,6 +113,10 @@ class CalendarResponse(BaseModel):
 
 class AgentTriggerRequest(BaseModel):
     composite_score: float
+
+
+class ThresholdUpdate(BaseModel):
+    value: float
 
 
 class MuseMetricsSession:
@@ -654,6 +663,28 @@ def _generate_intervention_message(
         return 'Take a mindful pause and reset your nervous system.'
 
 
+async def run_agent_intervention(
+    client_id: str,
+    composite_score: float,
+    delay_seconds: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    try:
+        creds = _load_credentials(client_id)
+    except RuntimeError:
+        return None
+    events = fetch_calendar_events(creds)
+    now_ts = time.time()
+    current_event = next((event for event in events if event.start_ts <= now_ts <= event.end_ts), None)
+    next_event = next((event for event in events if event.start_ts > now_ts), None)
+    message = _generate_intervention_message(composite_score, current_event, next_event)
+    asyncio.create_task(_dispatch_notification(message, 'Stress Compass', delay_seconds))
+    return {
+        'message': message,
+        'current_event': current_event,
+        'next_event': next_event,
+    }
+
+
 app = FastAPI(title='Muse Metrics API', version='0.1.0')
 
 app.add_middleware(
@@ -695,7 +726,7 @@ async def calculate_baseline_endpoint(request: BaselineRequest) -> BaselineRespo
 
 
 @app.post('/monitor', response_model=MonitorResponse)
-async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
+async def monitor_with_baseline(request: MonitorRequest, client_id: Optional[str] = None) -> MonitorResponse:
     try:
         current_metrics, sample_count, hrv_seconds = await sample_current_metrics(
             request.duration_seconds
@@ -709,6 +740,19 @@ async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
         threshold=request.deviation_threshold,
     )
 
+    auto_triggered = False
+    threshold = STRESS_TRIGGER_THRESHOLD
+    if client_id:
+        threshold = THRESHOLD_STORE.get(client_id, STRESS_TRIGGER_THRESHOLD)
+
+    if client_id and composite_score >= threshold:
+        last_trigger = LAST_AGENT_TRIGGER.get(client_id, 0)
+        if time.time() - last_trigger >= AGENT_COOLDOWN_SECONDS:
+            result = await run_agent_intervention(client_id, composite_score)
+            if result:
+                LAST_AGENT_TRIGGER[client_id] = time.time()
+                auto_triggered = True
+
     return MonitorResponse(
         timestamp=time.time(),
         metrics=current_metrics,
@@ -717,6 +761,7 @@ async def monitor_with_baseline(request: MonitorRequest) -> MonitorResponse:
         sample_count=sample_count,
         hrv_sample_seconds=hrv_seconds,
         composite_score=composite_score,
+        auto_triggered=auto_triggered,
     )
 
 
@@ -748,26 +793,15 @@ async def read_calendar_events(client_id: str) -> CalendarResponse:
 @app.post('/agent/mock-trigger')
 async def mock_trigger(request: AgentTriggerRequest, client_id: str):
     try:
-        creds = _load_credentials(client_id)
-        events = fetch_calendar_events(creds)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result = await run_agent_intervention(client_id, request.composite_score, delay_seconds=15.0)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    now_ts = time.time()
-    current_event = next((event for event in events if event.start_ts <= now_ts <= event.end_ts), None)
-    next_event = next((event for event in events if event.start_ts > now_ts), None)
-
-    message = _generate_intervention_message(request.composite_score, current_event, next_event)
-    delay = 0.0
-    asyncio.create_task(_dispatch_notification(message, 'Stress Compass', delay))
+    if not result:
+        raise HTTPException(status_code=400, detail='Calendar not connected for this client.')
     return {
-        'status': 'scheduled' if delay > 0 else 'sent',
-        'delay_seconds': delay,
-        'message': message,
-        'current_event': current_event,
-        'next_event': next_event,
+        'status': 'sent',
+        'delay_seconds': 0.0,
+        **result,
     }
 
 
@@ -807,6 +841,17 @@ async def calendar_oauth_callback(request: Request):
         return HTMLResponse(f'<p>Failed to exchange token: {exc}</p>')
     _store_credentials(client_id, flow.credentials)
     return HTMLResponse('<p>Stress Compass connected! You can close this window.</p>')
+
+
+@app.get('/agent/threshold')
+async def read_threshold(client_id: str) -> Dict[str, float]:
+    return {'value': THRESHOLD_STORE.get(client_id, STRESS_TRIGGER_THRESHOLD)}
+
+
+@app.post('/agent/threshold')
+async def update_threshold(request: ThresholdUpdate, client_id: str) -> Dict[str, float]:
+    THRESHOLD_STORE[client_id] = request.value
+    return {'value': request.value}
 
 
 @app.websocket('/ws/metrics')

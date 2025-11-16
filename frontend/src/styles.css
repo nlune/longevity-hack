@@ -368,6 +368,22 @@ button.ghost.active {
   margin: 0.5rem 0;
 }
 
+.manual-score {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.manual-score input {
+  width: 5rem;
+  padding: 0.3rem;
+  border-radius: 0.4rem;
+  border: 1px solid #cbd5f5;
+  font-family: 'JetBrains Mono', 'SFMono-Regular', monospace;
+}
+
 .insights-card {
   display: flex;
   flex-direction: column;

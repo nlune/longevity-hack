@@ -115,6 +115,7 @@ function isBeneficialDeviation(metric, deviation) {
 }
 
 export default function App() {
+  const [clientId, setClientId] = useState(null);
   const {
     baseline,
     baselineError,
@@ -131,9 +132,9 @@ export default function App() {
     monitorDuration: MONITOR_DURATION,
     monitorInterval: MONITOR_INTERVAL,
     historyLimit: 240,
+    clientId,
   });
   const liveStream = useMuseStream(WS_URL);
-  const [clientId, setClientId] = useState(null);
   const [breathingPhase, setBreathingPhase] = useState(BREATHING_PHASES[0]);
   const breathingTimeoutRef = useRef(null);
   const deviationNotificationRef = useRef(null);
@@ -146,6 +147,7 @@ export default function App() {
   const [calendarStatus, setCalendarStatus] = useState('disconnected');
   const [calendarEvents, setCalendarEvents] = useState([]);
   const [agentMessage, setAgentMessage] = useState(null);
+  const [threshold, setThreshold] = useState(1.5);
 
   const monitorReady = Boolean(baseline && monitorResult);
   const monitorStatusLabel = {
@@ -252,6 +254,39 @@ export default function App() {
       });
   };
 
+  const fetchThresholdValue = async () => {
+    if (!clientId) {
+      return;
+    }
+    try {
+      const response = await fetch(`${API_URL}/agent/threshold?client_id=${clientId}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (typeof data.value === 'number') {
+          setThreshold(data.value);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to fetch threshold', error);
+    }
+  };
+
+  const updateThresholdValue = async (value) => {
+    if (!clientId) {
+      return;
+    }
+    try {
+      setThreshold(value);
+      await fetch(`${API_URL}/agent/threshold?client_id=${clientId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      });
+    } catch (error) {
+      console.error('Failed to update threshold', error);
+    }
+  };
+
   const fetchCalendarEvents = async () => {
     if (!clientId) {
       return;
@@ -265,6 +300,7 @@ export default function App() {
       const data = await response.json();
       setCalendarEvents(data.events || []);
       setCalendarStatus('connected');
+      fetchThresholdValue();
     } catch (error) {
       console.error('Calendar fetch failed', error);
       setCalendarStatus('error');
@@ -328,6 +364,7 @@ export default function App() {
             }
             setCalendarStatus('connected');
             fetchCalendarEvents();
+            fetchThresholdValue();
           }
         } catch (error) {
           console.error('Status check failed', error);
@@ -349,6 +386,7 @@ export default function App() {
         if (data.connected) {
           setCalendarStatus('connected');
           fetchCalendarEvents();
+          fetchThresholdValue();
         }
       })
       .catch(() => {});
@@ -556,14 +594,6 @@ export default function App() {
           >
             {calendarStatus === 'connected' ? 'Refresh calendar' : 'Connect calendar'}
           </button>
-          <button
-            type="button"
-            className="ghost"
-            onClick={triggerAgent}
-            disabled={!monitorResult?.composite_score || calendarStatus !== 'connected'}
-          >
-            Mock stress trigger
-          </button>
         </div>
         {agentMessage && <p className="muted" style={{ marginBottom: '0.5rem' }}>{agentMessage}</p>}
         {monitorError && <p className="error">{monitorError}</p>}
@@ -656,6 +686,35 @@ export default function App() {
         <div className="graph-visualizer">
           <LiveWaves url={WS_URL} stream={liveStream} />
         </div>
+      </div>
+
+      <div className="card debug-card">
+        <h3>Agent Debug</h3>
+        <p className="muted">
+          Use this only if you need to simulate a stress event manually. Real triggers fire automatically when the stress index is high.
+        </p>
+        <div className="manual-score">
+          <label htmlFor="threshold-input">Trigger threshold (σ):</label>
+          <input
+            id="threshold-input"
+            type="number"
+            min="0"
+            max="5"
+            step="0.1"
+            value={threshold}
+            onChange={(event) => setThreshold(Number(event.target.value) || 0)}
+            onBlur={(event) => updateThresholdValue(Number(event.target.value) || 0)}
+          />
+          <span className="muted small">Auto trigger fires when stress index ≥ this value.</span>
+        </div>
+        <button
+          type="button"
+          className="ghost"
+          onClick={triggerAgent}
+          disabled={!monitorResult?.composite_score || calendarStatus !== 'connected'}
+        >
+          Mock stress trigger
+        </button>
       </div>
     </div>
   );
