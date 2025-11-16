@@ -12,7 +12,8 @@ The goal is simple: deliver a subtle nudge the moment your mind drifts into dysr
 2. Start the server with `python main.py` (or `uvicorn backend:app --reload`).
 3. `POST /baseline` records a one-minute calibration window (EEG bands + HRV).
 4. `POST /monitor` samples a fresh window, compares against baseline, and returns deviations plus alerts when stress proxies spike.
-5. `GET /metrics` and `ws://localhost:8000/ws/metrics` expose the raw streaming data for the frontend.
+5. `POST /notify` (macOS) schedules a desktop notification with a configurable delay—used now for manual tests and later by the agentic workflow.
+6. `GET /metrics` and `ws://localhost:8000/ws/metrics` expose the raw streaming data for the frontend.
 
 _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=true` to enable the built-in simulator for UI testing.
 
@@ -27,7 +28,11 @@ _Pro tip:_ When no Muse headset or PPG stream is detected, set `MUSE_MOCK_MODE=t
 ### How It Works
 
 - **Baseline calibration:** A one-minute session measures personal EEG ratios (alpha/theta/beta) and HRV (RMSSD, SDNN, LF/HF). The system stores means and standard deviations for each metric.
-- **Deviation monitoring:** Every ~30 seconds the backend collects a fresh window, computes z-scores relative to baseline, and aggregates them into “relaxation,” “engagement,” and “stress” proxies.
-- **Nudges, not nags:** Positive deviations (e.g., calmer-than-usual alpha or steadier HRV) appear in green cards and history charts. Negative deviations (stress spikes, engagement drops) tint red/orange and may trigger notifications so you can intervene early.
+- **Deviation monitoring:** Every ~30 seconds the backend collects a fresh window, computes z-scores relative to baseline, and aggregates them into three interpretable proxies:
+  - *Relaxation* blends alpha/theta ratios with HRV RMSSD (higher = calmer, parasympathetic state).
+  - *Engagement* balances beta concentration against theta drift (higher = focused, mentally present).
+  - *Stress / scatter* weighs LF/HF against HRV RMSSD to detect sympathetic spikes.
+  A weighted composite of all deviations (positive spikes inverted, negative drops preserved) becomes the **stress index**, the single number used for current alerts and future agentic logic.
+- **Nudges, not nags:** Positive deviations (e.g., calmer-than-usual alpha or steadier HRV) appear in green cards and history charts. Negative deviations (stress spikes, engagement drops, HRV dips) tint red/orange and may trigger notifications so you can intervene early.
 
 By cycling between awareness and action throughout the day, Stress Compass helps dial down chronic sympathetic load—the exact pattern linked to burnout, anxiety, and metabolic disease—supporting a longer, healthier life.
